@@ -89,7 +89,7 @@ class Harness {
       val schema: Schema = js.from(ujson.Readable, ujson.Readable.fromString(testCase.schema.noSpaces),
         registry = registry)
       val effectiveRegistry = new FallbackRegistry(registry, Harness.metaschemas)
-      val validator = js.validator(schema, Config(dialect = Dialect.FullSpec, ffast = false), effectiveRegistry)
+      val validator = js.validator(schema, Config(dialect = Dialect.FullSpec, ffast = false, resolveDialect = true), effectiveRegistry)
 
       val resultArray = testCase.tests.map { test =>
         val outcome = ujson.read(test.instance.noSpaces).transform(validator)
