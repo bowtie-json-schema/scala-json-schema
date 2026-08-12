@@ -14,7 +14,7 @@ libraryDependencies ++= Seq(
   "io.circe" %% "circe-parser"
 ).map(_ % circeVersion)
 
-val jsonSchemaVersion = "0.3.0"
+val jsonSchemaVersion = "0.3.1"
 libraryDependencies += "io.github.jam01" %% "json-schema" % jsonSchemaVersion
 
 // Not a transitive dependency of json-schema (see its README) - pinned to the exact
