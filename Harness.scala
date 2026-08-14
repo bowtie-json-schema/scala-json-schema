@@ -12,8 +12,8 @@ import io.github.jam01.json_schema as js
 // The library resolves `$ref` purely against the supplied Registry - it doesn't bundle
 // the official meta-schema documents itself, so a schema that `$ref`s its own dialect's
 // meta-schema (e.g. the test suite's "remote ref, containing refs itself" case) needs
-// them supplied. Falls back to the officially bundled 2020-12 meta-schemas whenever a
-// URI isn't found in the per-case registry.
+// them supplied. Falls back to the officially bundled 2020-12 meta-schemas and test-suite
+// remotes whenever a URI isn't found in the per-case registry bowtie sent.
 final class FallbackRegistry(primary: Registry, fallback: Registry) extends Registry {
   override def contains(schemaUri: Uri): Boolean = primary.contains(schemaUri) || fallback.contains(schemaUri)
   override def get(schemaUri: Uri): Option[Schema] = primary.get(schemaUri).orElse(fallback.get(schemaUri))
@@ -88,11 +88,16 @@ class Harness {
 
       val schema: Schema = js.from(ujson.Readable, ujson.Readable.fromString(testCase.schema.noSpaces),
         registry = registry)
-      val effectiveRegistry = new FallbackRegistry(registry, Harness.metaschemas)
+      val effectiveRegistry = new FallbackRegistry(registry, new FallbackRegistry(Harness.metaschemas, Harness.remotes))
       val validator = js.validator(schema, Config(dialect = Dialect.FullSpec, ffast = false, resolveDialect = true), effectiveRegistry)
 
       val resultArray = testCase.tests.map { test =>
-        val outcome = ujson.read(test.instance.noSpaces).transform(validator)
+        // Single-pass parse straight into the validator, same as the schema above - not
+        // ujson.read(...).transform(...), which builds a ujson.Value AST first. ujson.Value's
+        // number storage is Double-only, so that path silently rounded large integers (e.g.
+        // optional/bignum.json's maximum/minimum comparison cases) before the library ever saw
+        // them, while the schema side (parsed via js.from) was already precision-safe.
+        val outcome = ujson.Readable.transform(ujson.Readable.fromString(test.instance.noSpaces), validator)
         Json.obj("valid" -> outcome.vvalid.asJson)
       }
       RunResponse(runRequest.seq, resultArray.toVector).asJson.noSpaces
@@ -161,6 +166,26 @@ object Harness {
       val is = getClass.getResourceAsStream(s"/metaschemas/$resource")
       val text = new String(is.readAllBytes(), StandardCharsets.UTF_8)
       js.from(ujson.Readable, ujson.Readable.fromString(text), docbase = Uri(uri), registry = reg)
+    }
+    reg
+  }
+
+  // The test suite's `remotes/` directory, bundled as resources and pre-registered under their
+  // canonical http://localhost:1234/<rel> URIs (per JSON-Schema-Test-Suite's README § "Additional
+  // Assumptions"). Bowtie only forwards remotes it finds by scanning a case's schema for literal
+  // `$ref` occurrences, so a remote reached only via `$schema` (e.g. optional/format-assertion.json's
+  // custom-vocabulary metaschemas) was never sent, and every such case errored as unresolvable even
+  // though the library itself handles it fine once the remote is available. Loading the whole set
+  // up front as a fallback - same pattern as `metaschemas` above - covers those cases generally
+  // rather than special-casing the ones the official suite happens to exercise today.
+  val remotes: MutableRegistry = {
+    val reg = new MutableRegistry
+    val index = getClass.getResourceAsStream("/remotes-index.txt")
+    val paths = new String(index.readAllBytes(), StandardCharsets.UTF_8).linesIterator.filter(_.nonEmpty)
+    paths.foreach { rel =>
+      val is = getClass.getResourceAsStream(s"/remotes/$rel")
+      val text = new String(is.readAllBytes(), StandardCharsets.UTF_8)
+      js.from(ujson.Readable, ujson.Readable.fromString(text), docbase = Uri(s"http://localhost:1234/$rel"), registry = reg)
     }
     reg
   }
