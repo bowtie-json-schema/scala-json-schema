@@ -3,6 +3,7 @@ import io.circe.parser.parse
 import io.circe.syntax.EncoderOps
 import io.circe.{Json, Decoder}
 import java.io.InputStream
+import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.util.Scanner
 import java.util.jar.Manifest
@@ -78,6 +79,14 @@ class Harness {
     }
 
     val runRequest: RunRequest = decodeTo[RunRequest](node)
+    val output = runRequest.output.getOrElse("flag")
+    if (output != "flag" && output != "annotations") {
+      return RunSkippedResponse(
+        runRequest.seq,
+        message = Some(s"Unsupported output format: $output")
+      ).asJson.noSpaces
+    }
+
     val testCase = runRequest.testCase
     try {
       val registry = new MutableRegistry
@@ -89,7 +98,22 @@ class Harness {
       val schema: Schema = js.from(ujson.Readable, ujson.Readable.fromString(testCase.schema.noSpaces),
         registry = registry)
       val effectiveRegistry = new FallbackRegistry(registry, new FallbackRegistry(Harness.metaschemas, Harness.remotes))
-      val validator = js.validator(schema, Config(dialect = Dialect.FullSpec, ffast = false, resolveDialect = true), effectiveRegistry)
+      val hasExplicitSchema = schema match {
+        case o: js.ObjectSchema => o.getMetaSchema.isDefined
+        case _                  => false
+      }
+      val config =
+        if (output == "annotations")
+          Config(
+            dialect = Dialect.FullSpec,
+            ffast = false,
+            resolveDialect = hasExplicitSchema,
+            format = js.OutputFormat.Basic,
+            allowList = js.AllowList.KeepAll
+          )
+        else
+          Config(dialect = Dialect.FullSpec, ffast = false, resolveDialect = hasExplicitSchema)
+      val validator = js.validator(schema, config, effectiveRegistry)
 
       val resultArray = testCase.tests.map { test =>
         // Single-pass parse straight into the validator, same as the schema above - not
@@ -98,7 +122,21 @@ class Harness {
         // optional/bignum.json's maximum/minimum comparison cases) before the library ever saw
         // them, while the schema side (parsed via js.from) was already precision-safe.
         val outcome = ujson.Readable.transform(ujson.Readable.fromString(test.instance.noSpaces), validator)
-        Json.obj("valid" -> outcome.vvalid.asJson)
+        if (output == "annotations") {
+          val annotations =
+            if (outcome.vvalid) {
+              outcome.details.flatMap { u =>
+                if (!u.valid) None
+                else u.annotation match {
+                  case ann: js.Value => Some(toAnnotationJson(u, ann))
+                  case null          => None
+                }
+              }
+            } else Seq.empty
+          Json.obj("valid" -> outcome.vvalid.asJson, "annotations" -> Json.fromValues(annotations))
+        } else {
+          Json.obj("valid" -> outcome.vvalid.asJson)
+        }
       }
       RunResponse(runRequest.seq, resultArray.toVector).asJson.noSpaces
     } catch {
@@ -106,6 +144,36 @@ class Harness {
         val error: ErrorContext = ErrorContext(e.getMessage, e.getStackTrace.mkString("\n"))
         RunErroredResponse(runRequest.seq, context = error).asJson.noSpaces
     }
+  }
+
+  private def toAnnotationJson(unit: js.OutputUnit, annotation: js.Value): Json = {
+    val locationField =
+      if (unit.absKwLoc != null) "absoluteKeywordLocation" -> unit.absKwLoc.toString.asJson
+      else {
+        val rawFrag = Option(new URI(null, null, null, unit.kwLoc.toString).getRawFragment).getOrElse("")
+        "keywordLocation" -> s"#$rawFrag".asJson
+      }
+
+    Json.obj(
+      "keyword" -> unit.kwLoc.refTokens.last.asJson,
+      "instanceLocation" -> unit.insLoc.toString.asJson,
+      locationField,
+      "annotation" -> valueToJson(annotation)
+    )
+  }
+
+  private def valueToJson(value: js.Value): Json = value match {
+    case js.Null              => Json.Null
+    case b: js.Bool           => Json.fromBoolean(b.value)
+    case js.Int64(l)          => Json.fromLong(l)
+    case js.Float64(d)        => Json.fromDoubleOrNull(d)
+    case js.Int128(i)         => Json.fromBigInt(i)
+    case js.Decimal(d)        => Json.fromBigDecimal(d)
+    case js.Str(s)            => Json.fromString(s)
+    case js.Arr(arr)          => Json.fromValues(arr.map(valueToJson))
+    case js.Obj(map)          => Json.fromFields(map.view.map { case (k, v) => k -> valueToJson(v) })
+    case b: js.BooleanSchema  => Json.fromBoolean(b.value)
+    case o: js.ObjectSchema   => Json.fromFields(o.value.view.map { case (k, v) => k -> valueToJson(v) })
   }
 
   def decodeTo[Request: Decoder](json: Json): Request = {
@@ -131,8 +199,8 @@ case class DialectRequest(dialect: String)
 
 case class DialectResponse(ok: Boolean)
 
-case class RunRequest(seq: Json, testCase: TestCase)
-implicit val decodeRunRequest: Decoder[RunRequest] = Decoder.forProduct2("seq", "case")(RunRequest.apply)
+case class RunRequest(seq: Json, testCase: TestCase, output: Option[String])
+implicit val decodeRunRequest: Decoder[RunRequest] = Decoder.forProduct3("seq", "case", "output")(RunRequest.apply)
 
 case class RunResponse(seq: Json, results: Vector[Json])
 
